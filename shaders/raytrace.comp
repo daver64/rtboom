@@ -1,0 +1,350 @@
+#version 430 core
+
+layout(local_size_x = 8, local_size_y = 8) in;
+
+layout(rgba8, binding = 0) uniform writeonly image2D uTarget;
+
+uniform float uTime;
+uniform ivec2 uTargetSize;
+uniform vec3 uCamPos;
+uniform vec3 uCamForward;
+uniform vec3 uCamRight;
+uniform vec3 uCamUp;
+uniform float uCamFovScale;
+uniform usampler2D uDungeon;
+uniform ivec2 uDungeonSize;
+uniform vec2 uDungeonOrigin;
+uniform float uDungeonCellSize;
+uniform sampler2DArray uFloorTex;
+uniform sampler2DArray uCeilTex;
+uniform sampler2DArray uWallTex;
+uniform ivec2 uFloorTexSize;
+uniform ivec2 uCeilTexSize;
+uniform ivec2 uWallTexSize;
+uniform int uFloorTexLayers;
+uniform int uCeilTexLayers;
+uniform int uWallTexLayers;
+uniform usampler2D uFloorLayerMap;
+uniform usampler2D uCeilLayerMap;
+uniform usampler2D uLightMap;
+uniform int uWallSegmentCount;
+
+layout(std430, binding = 0) readonly buffer WallSegmentBuffer {
+    vec4 uWallSegments[];
+};
+
+layout(std430, binding = 1) readonly buffer WallSegmentAttribBuffer {
+    vec4 uWallSegmentAttribs[];
+};
+
+const float kInf = 1e20;
+const float kFloorY = 0.0;
+const float kCeilY = 3.2;
+const float kEps = 0.001;
+
+uint dungeonCell(ivec2 c) {
+    if (c.x < 0 || c.y < 0 || c.x >= uDungeonSize.x || c.y >= uDungeonSize.y) {
+        return 2u;
+    }
+    return texelFetch(uDungeon, c, 0).r;
+}
+
+vec2 worldToGrid(vec2 world) {
+    return (world - uDungeonOrigin) / max(uDungeonCellSize, 1e-5);
+}
+
+bool traceDDA(vec3 ro, vec3 rd, out float tHit, out vec3 nHit, out uint wallType) {
+    float cellSize = max(uDungeonCellSize, 1e-5);
+    vec2 ray = rd.xz / cellSize;
+    if (abs(ray.x) < 1e-6 && abs(ray.y) < 1e-6) {
+        return false;
+    }
+
+    vec2 p = worldToGrid(ro.xz);
+    ivec2 map = ivec2(floor(p));
+
+    vec2 delta = vec2(
+        (abs(ray.x) < 1e-6) ? kInf : abs(1.0 / ray.x),
+        (abs(ray.y) < 1e-6) ? kInf : abs(1.0 / ray.y));
+
+    ivec2 step = ivec2(ray.x < 0.0 ? -1 : 1, ray.y < 0.0 ? -1 : 1);
+
+    vec2 sideDist;
+    sideDist.x = (ray.x < 0.0) ? (p.x - float(map.x)) * delta.x : (float(map.x + 1) - p.x) * delta.x;
+    sideDist.y = (ray.y < 0.0) ? (p.y - float(map.y)) * delta.y : (float(map.y + 1) - p.y) * delta.y;
+
+    for (int i = 0; i < 1400; ++i) {
+        int side = 0;
+        float t = sideDist.x;
+        if (sideDist.y < sideDist.x) {
+            side = 1;
+            t = sideDist.y;
+            map.y += step.y;
+            sideDist.y += delta.y;
+        } else {
+            map.x += step.x;
+            sideDist.x += delta.x;
+        }
+
+        uint cell = dungeonCell(map);
+        if (cell == 0u) {
+            continue;
+        }
+
+        tHit = t;
+        wallType = cell;
+        if (side == 0) {
+            nHit = vec3((step.x > 0) ? -1.0 : 1.0, 0.0, 0.0);
+        } else {
+            nHit = vec3(0.0, 0.0, (step.y > 0) ? -1.0 : 1.0);
+        }
+        return true;
+    }
+
+    return false;
+}
+
+float cross2(vec2 a, vec2 b) {
+    return a.x * b.y - a.y * b.x;
+}
+
+bool traceSegments(
+    vec3 ro,
+    vec3 rd,
+    out float tHit,
+    out vec3 nHit,
+    out uint wallType,
+    out float wallLight,
+    out float wallLayer) {
+    vec2 p = ro.xz;
+    vec2 r = rd.xz;
+    float rLen2 = dot(r, r);
+    if (rLen2 < 1e-8) {
+        return false;
+    }
+
+    float bestT = kInf;
+    vec3 bestN = vec3(0.0);
+    float bestLight = 160.0 / 255.0;
+    float bestLayer = 0.0;
+    bool found = false;
+
+    int segCount = clamp(uWallSegmentCount, 0, 256);
+    for (int i = 0; i < segCount; ++i) {
+        vec4 seg = uWallSegments[i];
+        vec2 a = seg.xy;
+        vec2 b = seg.zw;
+        vec2 s = b - a;
+        float sLen2 = dot(s, s);
+        if (sLen2 < 1e-8) {
+            continue;
+        }
+
+        float denom = cross2(r, s);
+        if (abs(denom) < 1e-8) {
+            continue;
+        }
+
+        vec2 qp = a - p;
+        float t = cross2(qp, s) / denom;
+        float u = cross2(qp, r) / denom;
+        if (t <= 0.001 || u < 0.0 || u > 1.0) {
+            continue;
+        }
+        if (t >= bestT) {
+            continue;
+        }
+
+        vec2 n2 = vec2(-s.y, s.x) * inversesqrt(sLen2);
+        if (dot(n2, r) > 0.0) {
+            n2 = -n2;
+        }
+
+        bestT = t;
+        bestN = vec3(n2.x, 0.0, n2.y);
+        bestLight = clamp(uWallSegmentAttribs[i].x, 0.0, 1.0);
+        bestLayer = clamp(uWallSegmentAttribs[i].y, 0.0, float(max(uWallTexLayers - 1, 0)));
+        found = true;
+    }
+
+    if (!found) {
+        return false;
+    }
+
+    tHit = bestT;
+    nHit = bestN;
+    wallType = 1u;
+    wallLight = bestLight;
+    wallLayer = bestLayer;
+    return true;
+}
+
+float shadowVisibility(vec3 pos, vec3 lpos) {
+    return 1.0;
+}
+
+vec3 baseWallColor(uint wallType) {
+    if (wallType == 2u) {
+        return vec3(0.40, 0.40, 0.42);
+    }
+    return vec3(0.56, 0.19, 0.17);
+}
+
+vec3 sampleFloor(vec3 p) {
+    float worldToDoom = 16.0 / max(uDungeonCellSize, 1e-5);
+    vec2 texSize = vec2(max(uFloorTexSize.x, 1), max(uFloorTexSize.y, 1));
+    vec2 uv = (p.xz * worldToDoom) / texSize;
+    ivec2 cell = ivec2(floor(worldToGrid(p.xz)));
+    int layer = int(texelFetch(uFloorLayerMap, cell, 0).r);
+    layer = clamp(layer, 0, max(uFloorTexLayers - 1, 0));
+    return texture(uFloorTex, vec3(uv, float(layer))).rgb;
+}
+
+vec3 sampleCeiling(vec3 p) {
+    float worldToDoom = 16.0 / max(uDungeonCellSize, 1e-5);
+    vec2 texSize = vec2(max(uCeilTexSize.x, 1), max(uCeilTexSize.y, 1));
+    vec2 uv = (vec2(p.x, -p.z) * worldToDoom) / texSize;
+    ivec2 cell = ivec2(floor(worldToGrid(p.xz)));
+    int layer = int(texelFetch(uCeilLayerMap, cell, 0).r);
+    layer = clamp(layer, 0, max(uCeilTexLayers - 1, 0));
+    return texture(uCeilTex, vec3(uv, float(layer))).rgb;
+}
+
+vec3 sampleWall(vec3 p, vec3 n, uint wallType, float wallLight, float wallLayer) {
+    float worldToDoom = 16.0 / max(uDungeonCellSize, 1e-5);
+    vec2 texSize = vec2(max(uWallTexSize.x, 1), max(uWallTexSize.y, 1));
+    vec2 uv;
+    if (abs(n.x) > abs(n.z)) {
+        uv = vec2(p.z * worldToDoom, p.y * worldToDoom) / texSize;
+    } else {
+        uv = vec2(p.x * worldToDoom, p.y * worldToDoom) / texSize;
+    }
+    vec3 texCol = texture(uWallTex, vec3(uv, wallLayer)).rgb;
+    vec3 lit = texCol;
+    if (wallType == 2u) {
+        lit *= vec3(0.9);
+    }
+    float lm = mix(0.2, 1.05, wallLight);
+    return lit * lm;
+}
+
+vec3 shadeSurface(vec3 pos, vec3 normal, vec3 albedo, vec3 viewDir) {
+    vec3 color = albedo * 0.11;
+
+    vec3 lightPos[3] = vec3[3](
+        vec3(0.0, 2.8, 0.0),
+        vec3(22.0 * cos(uTime * 0.25), 2.5, 18.0 * sin(uTime * 0.22)),
+        vec3(-18.0, 2.6, -20.0));
+    vec3 lightCol[3] = vec3[3](
+        vec3(1.00, 0.85, 0.72),
+        vec3(0.72, 0.84, 1.00),
+        vec3(0.84, 1.00, 0.78));
+    float lightPow[3] = float[3](12.0, 9.0, 8.0);
+
+    for (int i = 0; i < 3; ++i) {
+        vec3 toL = lightPos[i] - pos;
+        float d = length(toL);
+        vec3 l = toL / max(d, 1e-5);
+
+        float vis = shadowVisibility(pos + normal * 0.02, lightPos[i]);
+        float lambert = max(dot(normal, l), 0.0);
+        float att = lightPow[i] / (1.0 + d * d * 0.06);
+
+        vec3 hv = l + viewDir;
+        float hvLen2 = dot(hv, hv);
+        vec3 h = (hvLen2 > 1e-8) ? (hv * inversesqrt(hvLen2)) : normal;
+        float spec = pow(max(dot(normal, h), 0.0), 20.0) * 0.15;
+
+        color += (albedo * lambert + spec) * lightCol[i] * att * vis;
+    }
+
+    return color;
+}
+
+void main() {
+    ivec2 px = ivec2(gl_GlobalInvocationID.xy);
+    if (px.x >= uTargetSize.x || px.y >= uTargetSize.y) {
+        return;
+    }
+
+    vec2 ndc = ((vec2(px) + vec2(0.5)) / vec2(uTargetSize)) * 2.0 - 1.0;
+    float aspect = float(uTargetSize.x) / float(uTargetSize.y);
+    ndc.x *= aspect;
+
+    vec3 fwd = normalize(uCamForward);
+    vec3 right = normalize(uCamRight);
+    vec3 up = normalize(uCamUp);
+
+    vec3 rd = normalize(fwd + right * ndc.x * uCamFovScale + up * ndc.y * uCamFovScale);
+    vec3 ro = uCamPos;
+
+    float tWall = kInf;
+    vec3 nWall = vec3(0.0);
+    uint wallType = 1u;
+    float wallLight = 160.0 / 255.0;
+    float wallLayer = 0.0;
+    bool hasWall = traceSegments(ro, rd, tWall, nWall, wallType, wallLight, wallLayer);
+
+    float tPlane = kInf;
+    vec3 nPlane = vec3(0.0);
+    vec3 planeAlbedo = vec3(0.35);
+
+    if (rd.y < -1e-5) {
+        float tf = (kFloorY - ro.y) / rd.y;
+        if (tf > 0.0 && tf < tPlane) {
+            tPlane = tf;
+            nPlane = vec3(0.0, 1.0, 0.0);
+            planeAlbedo = vec3(0.34, 0.34, 0.35);
+        }
+    }
+    if (rd.y > 1e-5) {
+        float tc = (kCeilY - ro.y) / rd.y;
+        if (tc > 0.0 && tc < tPlane) {
+            tPlane = tc;
+            nPlane = vec3(0.0, -1.0, 0.0);
+            planeAlbedo = vec3(0.30, 0.30, 0.31);
+        }
+    }
+
+    vec3 color;
+    float t;
+    vec3 n;
+    vec3 albedo;
+    if (hasWall && tWall < tPlane) {
+        t = tWall;
+        n = nWall;
+        vec3 hp = ro + rd * t;
+        albedo = sampleWall(hp, nWall, wallType, wallLight, wallLayer);
+    } else if (tPlane < kInf) {
+        t = tPlane;
+        n = nPlane;
+        vec3 hp = ro + rd * t;
+        if (nPlane.y > 0.0) {
+            albedo = sampleFloor(hp);
+        } else {
+            albedo = sampleCeiling(hp);
+        }
+        ivec2 lcell = ivec2(floor(worldToGrid(hp.xz)));
+        float planeLight = float(texelFetch(uLightMap, lcell, 0).r) / 255.0;
+        albedo *= mix(0.2, 1.05, planeLight);
+        float checker = mod(floor(hp.x * 0.25) + floor(hp.z * 0.25), 2.0);
+        albedo = albedo * mix(0.9, 1.06, checker);
+    } else {
+        color = vec3(0.06, 0.07, 0.09);
+        imageStore(uTarget, px, vec4(color, 1.0));
+        return;
+    }
+
+    vec3 hitPos = ro + rd * t;
+    vec3 viewDir = normalize(-rd);
+    color = shadeSurface(hitPos, n, albedo, viewDir);
+
+    float fog = exp(-t * 0.018);
+    color = mix(vec3(0.06, 0.07, 0.09), color, fog);
+
+    // Mild tone mapping and gamma.
+    color = color / (color + vec3(1.0));
+    color = pow(color, vec3(1.0 / 2.2));
+
+    imageStore(uTarget, px, vec4(color, 1.0));
+}
