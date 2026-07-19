@@ -1,12 +1,12 @@
 # rtboom
 
-A Doom-inspired GPU renderer prototype built with modern OpenGL compute shaders, SDL3, and C++17.
+A Doom-inspired real-time ray-traced renderer prototype built with modern OpenGL compute shaders, SDL3, and C++17.
 
-`rtboom` loads classic WAD data (Freedoom assets included in `assets/`) and renders a playable first-person scene with software-era aesthetics, weapon HUD, audio effects, and collision against map geometry.
+`rtboom` loads classic WAD data (Freedoom assets included in `assets/`) and renders a playable first-person scene using per-pixel ray tracing/ray casting in a compute shader, with software-era aesthetics, weapon HUD, audio effects, and collision against map geometry.
 
 ## Highlights
 
-- OpenGL 4.3 compute-shader rendering pipeline
+- OpenGL 4.3 compute-shader ray-traced scene renderer
 - WAD-backed map loading (Freedoom map fallback path)
 - Classic FPS camera controls and wall collision
 - Weapon switching, recoil/flash feedback, and projectile overlays
